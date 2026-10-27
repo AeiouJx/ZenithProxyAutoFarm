@@ -290,7 +290,10 @@ public class AutoFarmModule extends Module {
     private void harvestBatchNext() {
         while (!batchHarvestQueue.isEmpty()) {
             BlockPos pos=batchHarvestQueue.removeFirst();
-            if (inspectCrop(pos)!=FarmAction.HARVEST) continue;
+            if (inspectCrop(pos)!=FarmAction.HARVEST) {
+                if (World.getBlock(pos).isAir()) forgetCropMaturity(pos);
+                continue;
+            }
             targetBlock=pos;
             targetAction=FarmAction.HARVEST;
             targetItem=null;
@@ -393,6 +396,7 @@ public class AutoFarmModule extends Module {
     private void interactWithCrop() {
         if (targetBlock == null || targetAction == null) { setState(State.SEARCH_CROP); return; }
         if (targetAction == FarmAction.HARVEST) {
+            forgetCropMaturity(targetBlock);
             Block block=World.getBlock(targetBlock);
             String crop=normalize(block.name());
             if (harvestBatchActive) {
@@ -725,7 +729,7 @@ public class AutoFarmModule extends Module {
             int stateId=World.getBlockStateId(pos);
             Integer age=World.getBlockState(pos).getProperty(BlockStateProperties.AGE_15);
             if (!isExpectedCropAtTarget(seed,crop,stateId)) {
-                if (World.getBlock(pos).isAir()) warn("AutoFarm did not observe planted {} at [{}, {}, {}]",seed,pos.x(),pos.y(),pos.z());
+                if (World.getBlock(pos).isAir()) warn("Previously confirmed planted {} is now absent at [{}, {}, {}]",seed,pos.x(),pos.y(),pos.z());
                 cropsWaitingForMaturity.remove(pos);
                 nextMaturityCheckAtMs.remove(pos);
                 continue;
@@ -744,6 +748,11 @@ public class AutoFarmModule extends Module {
             farmDebug("Crop {} at [{}, {}, {}] is still growing; next check in {} ticks",seed,pos.x(),pos.y(),pos.z(), PLUGIN_CONFIG.waitForCropMaturityTicks);
         }
         if (cropsWaitingForMaturity.isEmpty()) setState(State.SEARCH_PLANTING_BLOCK);
+    }
+
+    private void forgetCropMaturity(BlockPos pos) {
+        cropsWaitingForMaturity.remove(pos);
+        nextMaturityCheckAtMs.remove(pos);
     }
 
     private boolean isExpectedCropAtTarget(String seed,String crop,int stateId) {
