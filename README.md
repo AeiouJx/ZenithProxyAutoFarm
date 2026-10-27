@@ -1,6 +1,6 @@
 # ZenithProxy AutoFarm
 
-An AutoFarm plugin for ZenithProxy 1.21.4. It scans nearby loaded blocks and can harvest mature crops, plant configured items, till dirt, and apply bone meal. Configuration and command conventions follow the ZenithProxy Villager Trader plugin.
+An AutoFarm plugin for ZenithProxy 1.21.4. It scans nearby loaded blocks and can harvest mature crops, plant configured items, till dirt, and apply bone meal.
 
 [中文说明 / Chinese documentation](README_zh.md)
 

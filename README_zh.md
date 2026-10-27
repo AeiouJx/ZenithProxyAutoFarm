@@ -1,6 +1,6 @@
 # ZenithProxy 自动农场
 
-这是一个面向 ZenithProxy 1.21.4 的自动农场插件。它会扫描 bot 附近已加载的方块，可收割成熟作物、种植指定物品、耕地和使用骨粉。配置文件和命令风格参考 ZenithProxy 村民交易插件。
+这是一个面向 ZenithProxy 1.21.4 的自动农场插件。它会扫描 bot 附近已加载的方块，可收割成熟作物、种植指定物品、耕地和使用骨粉。
 
 [English README](README.md)
 
