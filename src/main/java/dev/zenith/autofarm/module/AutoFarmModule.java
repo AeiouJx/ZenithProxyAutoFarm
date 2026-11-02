@@ -8,7 +8,13 @@ import com.zenith.feature.inventory.actions.SetHeldItem;
 import com.zenith.feature.inventory.util.InventoryUtil;
 import com.zenith.feature.inventory.actions.ShiftClick;
 import com.zenith.feature.pathfinder.PathingRequestFuture;
+import com.zenith.feature.pathfinder.PathingCommand;
+import com.zenith.feature.pathfinder.PathingCommandType;
+import com.zenith.feature.pathfinder.goals.Goal;
+import com.zenith.feature.pathfinder.goals.GoalBlock;
+import com.zenith.feature.pathfinder.goals.GoalComposite;
 import com.zenith.feature.pathfinder.goals.GoalNear;
+import com.zenith.feature.pathfinder.process.FollowProcess;
 import com.zenith.feature.player.ClickTarget;
 import com.zenith.feature.player.Input;
 import com.zenith.feature.player.InputRequest;
@@ -23,6 +29,7 @@ import com.zenith.mc.block.BlockRegistry;
 import com.zenith.mc.block.properties.api.BlockStateProperties;
 import com.zenith.mc.item.ItemData;
 import com.zenith.mc.item.ItemRegistry;
+import com.zenith.cache.data.entity.EntityLiving;
 import com.zenith.module.api.Module;
 import com.zenith.event.client.ClientBotTick;
 import com.zenith.util.RequestFuture;
@@ -59,7 +66,10 @@ public class AutoFarmModule extends Module {
     private PathingRequestFuture pickupFuture=PathingRequestFuture.rejected;
     private long pickupStartedAtMs;
     private int pickupAttempts;
+    private long pickupNoDropsSinceMs;
     private static final long PLANT_RETRY_DELAY_MS = 30_000L;
+    private static final double HARVEST_DROP_SEARCH_RADIUS_SQ = 64.0;
+    private static final int MAIN_INVENTORY_PICKUP_RESERVE_SLOTS = 2;
     private final Timer waitForInteractTimer = Timers.tickTimer();
     private PathingRequestFuture cropPathingFuture = PathingRequestFuture.rejected;
     private PathingRequestFuture cropActionFuture = PathingRequestFuture.rejected;
@@ -92,6 +102,7 @@ public class AutoFarmModule extends Module {
         harvestBatchActive=false;
         pickupFuture=PathingRequestFuture.rejected;
         pickupAttempts=0;
+        pickupNoDropsSinceMs=0L;
         state=State.ENTRYPOINT;
         targetBlock=null;
         targetAction=null;
@@ -121,6 +132,8 @@ public class AutoFarmModule extends Module {
             && state.ordinal() < State.STORE_GO_TO_CHEST.ordinal()
             && PLUGIN_CONFIG.storageChest != null && !PLUGIN_CONFIG.storageChest.equals(BlockPos.ZERO)
             && now >= nextStorageAttemptAtMs) {
+            farmDebug("Starting storage: mainInventoryEmptySlots={} depositableFarmItems={}",
+                mainInventoryEmptySlots(),countStorableFarmItems(farmStorageItemIds()));
             clearCropTarget();
             setState(State.STORE_GO_TO_CHEST);
         }
@@ -143,6 +156,7 @@ public class AutoFarmModule extends Module {
             case WAIT_FOR_CROP_MATURITY -> waitForCropMaturity();
             case HARVEST_WAIT_FOR_DROPS -> waitForHarvestDrops();
             case HARVEST_PICKUP_DROPS -> pickupHarvestDrops();
+            case WAIT_FOR_INVENTORY_SPACE -> waitForInventorySpace();
             case STORE_GO_TO_CHEST -> goToStorageChest();
             case STORE_AWAIT_PATHING -> awaitStoragePathing();
             case STORE_OPEN_CHEST -> openStorageChest();
@@ -153,6 +167,9 @@ public class AutoFarmModule extends Module {
     }
 
     private void resetToEntrypoint() {
+        if (state==State.HARVEST_PICKUP_DROPS && BARITONE.getFollowProcess().isActive()) {
+            BARITONE.getFollowProcess().cancel();
+        }
         clearCropTarget();
         harvestBatchActive=false;
         batchHarvestQueue.clear();
@@ -161,6 +178,7 @@ public class AutoFarmModule extends Module {
         pendingPickupOrigin=null;
         pendingPickupOrigins.clear();
         pendingPickupItemIds=Set.of();
+        pickupNoDropsSinceMs=0L;
         state=State.ENTRYPOINT;
         waitForInteractTimer.reset();
     }
@@ -171,6 +189,11 @@ public class AutoFarmModule extends Module {
         if (PLUGIN_CONFIG.debugMode && debugTimer.tick(100)) farmDebug("Searching {} blocks within radius {}", candidates.size(), configuredSearchRadius());
         for (Candidate candidate : candidates) {
             if (inspectCrop(candidate.pos())!=FarmAction.HARVEST) continue;
+            if (!hasMainInventoryPickupReserve()) {
+                warn("AutoFarm paused harvesting: main inventory has no reserved room for crop drops");
+                setState(State.WAIT_FOR_INVENTORY_SPACE);
+                return;
+            }
             beginHarvestBatch(candidate.pos(),candidates);
             setState(State.CROP_GO_TO_BLOCK);
             return;
@@ -189,6 +212,15 @@ public class AutoFarmModule extends Module {
         }
         if (!cropsWaitingForMaturity.isEmpty()) setState(State.WAIT_FOR_CROP_MATURITY);
         else if (PLUGIN_CONFIG.plant) setState(State.SEARCH_PLANTING_BLOCK);
+    }
+
+    private void waitForInventorySpace() {
+        if (hasMainInventoryPickupReserve()) {
+            farmDebug("Main inventory has room for crop drops again");
+            setState(State.SEARCH_CROP);
+        } else if (waitForInteractTimer.tick(200)) {
+            warn("AutoFarm is waiting for room in the main inventory; clear slots or configure a reachable storage chest");
+        }
     }
 
     private void beginHarvestBatch(BlockPos anchor,List<Candidate> candidates) {
@@ -289,6 +321,11 @@ public class AutoFarmModule extends Module {
 
     private void harvestBatchNext() {
         while (!batchHarvestQueue.isEmpty()) {
+            if (!hasMainInventoryPickupReserve()) {
+                farmDebug("Stopping this harvest batch: main inventory pickup reserve is exhausted");
+                batchHarvestQueue.clear();
+                break;
+            }
             BlockPos pos=batchHarvestQueue.removeFirst();
             if (inspectCrop(pos)!=FarmAction.HARVEST) {
                 if (World.getBlock(pos).isAir()) forgetCropMaturity(pos);
@@ -652,25 +689,31 @@ public class AutoFarmModule extends Module {
     private void waitForHarvestDrops() {
         if (pendingPickupOrigin==null || pendingPickupItemIds.isEmpty()) { finishHarvestPickup(); return; }
         if (hasNearbyHarvestDrops()) {
+            pickupNoDropsSinceMs=0L;
             startHarvestPickup();
-        } else if (waitForInteractTimer.tick(10)) {
+        } else if (waitForInteractTimer.tick(20)) {
             farmDebug("No matching harvest drops appeared near [{}, {}, {}]",pendingPickupOrigin.x(),pendingPickupOrigin.y(),pendingPickupOrigin.z());
             finishHarvestPickup();
         }
     }
 
     private void startHarvestPickup() {
-        pickupFuture=BARITONE.getFollowProcess().pickup(stack -> pendingPickupItemIds.contains(stack.getId()));
+        pickupFuture=BARITONE.getFollowProcess().follow(nearbyHarvestDropTarget());
         pickupStartedAtMs=System.currentTimeMillis();
         pickupAttempts++;
-        farmDebug("Collecting {} matching drop types near [{}, {}, {}] (attempt {})",pendingPickupItemIds.size(),
-            pendingPickupOrigin.x(),pendingPickupOrigin.y(),pendingPickupOrigin.z(),pickupAttempts);
+        farmDebug("Collecting {} nearby drop entities for {} item types (attempt {})",nearbyHarvestDropEntities().size(),pendingPickupItemIds.size(),
+            pickupAttempts);
         setState(State.HARVEST_PICKUP_DROPS);
         waitForInteractTimer.reset();
     }
 
     private void pickupHarvestDrops() {
-        if (!hasNearbyHarvestDrops()) { finishHarvestPickup(); return; }
+        if (!hasNearbyHarvestDrops()) {
+            if (pickupNoDropsSinceMs==0L) pickupNoDropsSinceMs=System.currentTimeMillis();
+            if (System.currentTimeMillis()-pickupNoDropsSinceMs>=1_000L) finishHarvestPickup();
+            return;
+        }
+        pickupNoDropsSinceMs=0L;
         if (pickupFuture.isCompleted()) {
             if (!pickupFuture.isAccepted()) {
                 warn("AutoFarm pickup request was rejected near harvested block");
@@ -682,36 +725,60 @@ public class AutoFarmModule extends Module {
                 return;
             }
         }
-        if (System.currentTimeMillis()-pickupStartedAtMs>=10_000L) {
+        if (System.currentTimeMillis()-pickupStartedAtMs>=30_000L) {
             warn("AutoFarm pickup timed out; continuing with remaining farm targets");
             if (BARITONE.isActive()) BARITONE.getFollowProcess().cancel();
             finishHarvestPickup();
         }
     }
 
-    private boolean hasNearbyHarvestDrops() {
+    private FollowProcess.FollowTarget nearbyHarvestDropTarget() {
+        return () -> {
+            List<Goal> goals=new ArrayList<>();
+            for (EntityLiving itemEntity : nearbyHarvestDropEntities()) {
+                goals.add(new GoalBlock(itemEntity.blockPos()));
+            }
+            if (goals.isEmpty()) return null;
+            return new PathingCommand(new GoalComposite(goals.toArray(Goal[]::new)),
+                PathingCommandType.REVALIDATE_GOAL_AND_PATH);
+        };
+    }
+
+    private List<EntityLiving> nearbyHarvestDropEntities() {
         if (pendingPickupOrigins.isEmpty() && pendingPickupOrigin!=null) pendingPickupOrigins.add(pendingPickupOrigin);
-        if (pendingPickupOrigins.isEmpty() || pendingPickupItemIds.isEmpty()) return false;
+        if (pendingPickupOrigins.isEmpty() || pendingPickupItemIds.isEmpty()) return List.of();
+        List<EntityLiving> matchingDrops=new ArrayList<>();
         for (var entity : CACHE.getEntityCache().getEntities().values()) {
-            if (entity.getEntityType()!=EntityType.ITEM) continue;
-            var itemStack=entity.getMetadataValue(8,MetadataTypes.ITEM,ItemStack.class);
+            if (entity.getEntityType()!=EntityType.ITEM || !(entity instanceof EntityLiving itemEntity)) continue;
+            var itemStack=itemEntity.getMetadataValue(8,MetadataTypes.ITEM,ItemStack.class);
             if (itemStack==null || !pendingPickupItemIds.contains(itemStack.getId())) continue;
             for (BlockPos origin : pendingPickupOrigins) {
-                double dx=entity.getX()-origin.x()-0.5;
-                double dy=entity.getY()-origin.y()-0.5;
-                double dz=entity.getZ()-origin.z()-0.5;
-                if (dx*dx+dy*dy+dz*dz<=36.0) return true;
+                double dx=itemEntity.getX()-origin.x()-0.5;
+                double dy=itemEntity.getY()-origin.y()-0.5;
+                double dz=itemEntity.getZ()-origin.z()-0.5;
+                if (dx*dx+dy*dy+dz*dz<=HARVEST_DROP_SEARCH_RADIUS_SQ) {
+                    matchingDrops.add(itemEntity);
+                    break;
+                }
             }
         }
-        return false;
+        return matchingDrops;
+    }
+
+    private boolean hasNearbyHarvestDrops() {
+        return !nearbyHarvestDropEntities().isEmpty();
     }
 
     private void finishHarvestPickup() {
+        if (state==State.HARVEST_PICKUP_DROPS && BARITONE.getFollowProcess().isActive()) {
+            BARITONE.getFollowProcess().cancel();
+        }
         pendingPickupOrigin=null;
         pendingPickupOrigins.clear();
         pendingPickupItemIds=Set.of();
         pickupFuture=PathingRequestFuture.rejected;
         pickupAttempts=0;
+        pickupNoDropsSinceMs=0L;
         batchHarvestQueue.clear();
         batchPlantQueue.clear();
         batchPlantWaitTicks.clear();
@@ -735,6 +802,11 @@ public class AutoFarmModule extends Module {
                 continue;
             }
             if (mature(crop,age,stateId)) {
+                if (!hasMainInventoryPickupReserve()) {
+                    warn("AutoFarm is waiting for main inventory room before harvesting mature {}",crop);
+                    setState(State.WAIT_FOR_INVENTORY_SPACE);
+                    return;
+                }
                 cropsWaitingForMaturity.remove(pos);
                 nextMaturityCheckAtMs.remove(pos);
                 targetBlock=pos;
@@ -911,15 +983,21 @@ public class AutoFarmModule extends Module {
     private boolean shouldStoreFarmItems() {
         Set<Integer> farmItemIds=farmStorageItemIds();
         if (farmItemIds.isEmpty()) return false;
+        return mainInventoryEmptySlots()<=MAIN_INVENTORY_PICKUP_RESERVE_SLOTS
+            && countStorableFarmItems(farmItemIds)>0;
+    }
+
+    private boolean hasMainInventoryPickupReserve() {
+        return mainInventoryEmptySlots()>MAIN_INVENTORY_PICKUP_RESERVE_SLOTS;
+    }
+
+    private int mainInventoryEmptySlots() {
         int emptySlots=0;
-        boolean hasStorableFarmItems=false;
         var inventory=CACHE.getPlayerCache().getPlayerInventory();
         for (int slot=9;slot<=35;slot++) {
-            var stack=inventory.get(slot);
-            if (stack==com.zenith.cache.data.inventory.Container.EMPTY_STACK) emptySlots++;
-            else if (farmItemIds.contains(stack.getId())) hasStorableFarmItems=true;
+            if (inventory.get(slot)==com.zenith.cache.data.inventory.Container.EMPTY_STACK) emptySlots++;
         }
-        return hasStorableFarmItems && emptySlots<=2;
+        return emptySlots;
     }
 
     private List<InventoryAction> mainInventoryDepositActions(int containerId,
@@ -928,24 +1006,49 @@ public class AutoFarmModule extends Module {
         List<InventoryAction> actions=new ArrayList<>();
         int mainInventoryStart=openContainer.getSize()-36;
         int mainInventoryEnd=mainInventoryStart+27;
+        Set<Integer> retainedPlantingItems=hotbarPlantingItemIds();
+        Set<Integer> configuredPlantingItems=PLUGIN_CONFIG.plant ? configuredPlantingItemIds() : Set.of();
         for (int containerSlot=mainInventoryStart;containerSlot<mainInventoryEnd;containerSlot++) {
             var stack=openContainer.getItemStack(containerSlot);
-            if (stack!=com.zenith.cache.data.inventory.Container.EMPTY_STACK && farmItemIds.contains(stack.getId())) {
-                actions.add(new ShiftClick(containerId,containerSlot,ShiftClickItemAction.LEFT_CLICK));
-            }
+            if (stack==com.zenith.cache.data.inventory.Container.EMPTY_STACK || !farmItemIds.contains(stack.getId())) continue;
+            if (configuredPlantingItems.contains(stack.getId()) && retainedPlantingItems.add(stack.getId())) continue;
+            actions.add(new ShiftClick(containerId,containerSlot,ShiftClickItemAction.LEFT_CLICK));
         }
         return actions;
     }
 
     private int countStorableFarmItems(Set<Integer> farmItemIds) {
         var inventory=CACHE.getPlayerCache().getPlayerInventory();
+        Set<Integer> retainedPlantingItems=hotbarPlantingItemIds();
+        Set<Integer> configuredPlantingItems=PLUGIN_CONFIG.plant ? configuredPlantingItemIds() : Set.of();
         int count=0;
         for (int slot=9;slot<=35;slot++) {
             var stack=inventory.get(slot);
             if (stack==com.zenith.cache.data.inventory.Container.EMPTY_STACK || !farmItemIds.contains(stack.getId())) continue;
+            if (configuredPlantingItems.contains(stack.getId()) && retainedPlantingItems.add(stack.getId())) continue;
             count+=stack.getAmount();
         }
         return count;
+    }
+
+    private Set<Integer> configuredPlantingItemIds() {
+        Set<Integer> ids=new HashSet<>();
+        for (String item : PLUGIN_CONFIG.plantItems) addItemId(ids,item);
+        return ids;
+    }
+
+    private Set<Integer> hotbarPlantingItemIds() {
+        Set<Integer> ids=new HashSet<>();
+        if (!PLUGIN_CONFIG.plant) return ids;
+        Set<Integer> plantingIds=configuredPlantingItemIds();
+        var inventory=CACHE.getPlayerCache().getPlayerInventory();
+        for (int slot=36;slot<=44;slot++) {
+            var stack=inventory.get(slot);
+            if (stack!=com.zenith.cache.data.inventory.Container.EMPTY_STACK && plantingIds.contains(stack.getId())) {
+                ids.add(stack.getId());
+            }
+        }
+        return ids;
     }
 
     private Set<Integer> farmStorageItemIds() {
@@ -1171,6 +1274,7 @@ public class AutoFarmModule extends Module {
         WAIT_FOR_CROP_MATURITY,
         HARVEST_WAIT_FOR_DROPS,
         HARVEST_PICKUP_DROPS,
+        WAIT_FOR_INVENTORY_SPACE,
         STORE_GO_TO_CHEST,
         STORE_AWAIT_PATHING,
         STORE_OPEN_CHEST,
